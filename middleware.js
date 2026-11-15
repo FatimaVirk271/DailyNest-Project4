@@ -1,0 +1,145 @@
+// middleware.js - small helper functions that run BEFORE / AFTER our routes.
+
+// Consistent error format so the client never has to guess
+function sendError(res, status, code, message, details) {
+  const error = { code, message };
+  if (details) error.details = details;
+  return res.status(status).json({ success: false, error });
+}
+
+// Express 4 does not catch errors thrown inside async functions.
+// This wrapper sends them to errorHandler (clean 500) instead of crashing the request.
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// ---------------------------------------------------------------
+// CORS - lets a page that lives at ANOTHER address talk to this API.
+// Browsers block cross-origin requests unless the server says "this origin is allowed".
+// For requests with a JSON body / PUT / PATCH / DELETE the browser first sends a "preflight":
+// an OPTIONS request asking permission. We answer 204 with the allowed methods and headers.
+// ALLOWED_ORIGINS = comma-separated list. Pages served by this same server never need it.
+// ---------------------------------------------------------------
+const DEFAULT_ORIGINS = [
+  'http://localhost:3000', 'http://127.0.0.1:3000', // this server
+  'http://localhost:5500', 'http://127.0.0.1:5500', // VS Code Live Server
+  'http://localhost:5173', 'http://localhost:8080', // Vite / simple servers
+];
+
+function allowedOrigins() {
+  const fromEnv = (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim()).filter(Boolean);
+  return fromEnv.length ? fromEnv : DEFAULT_ORIGINS;
+}
+
+function cors(req, res, next) {
+  const origin = req.get('Origin');
+  if (!origin) return next(); // same-origin pages, curl and Postman send no Origin header
+
+  res.set('Vary', 'Origin');
+  const list = allowedOrigins();
+  const allowed = list.includes('*') || list.includes(origin);
+
+  if (!allowed) {
+    // The preflight is refused, so the browser never sends the real request.
+    if (req.method === 'OPTIONS') return sendError(res, 403, 'CORS_BLOCKED', 'This origin is not allowed');
+    return next(); // no CORS headers: the browser will not let that page read the answer
+  }
+
+  res.set('Access-Control-Allow-Origin', origin);
+  res.set('Access-Control-Expose-Headers', 'Location, Retry-After'); // headers the page may read
+
+  if (req.method === 'OPTIONS') { // the preflight question
+    res.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+    res.set('Access-Control-Max-Age', '600'); // the browser may remember the answer for 10 minutes
+    return res.status(204).end();
+  }
+  next();
+}
+
+// Prints: GET /api/tasks 200 3ms
+function requestLogger(req, res, next) {
+  if (process.env.SILENT === '1') return next();
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+  });
+  next();
+}
+
+// Rate limiter: max N requests per minute per IP, otherwise 429 Too Many Requests
+const WINDOW_MS = 60 * 1000;
+const hits = new Map(); // ip -> { count, resetAt }
+
+function rateLimiter(req, res, next) {
+  const max = Number(process.env.RATE_LIMIT_MAX) || 200;
+  const now = Date.now();
+  let entry = hits.get(req.ip);
+
+  if (!entry || entry.resetAt <= now) {
+    entry = { count: 0, resetAt: now + WINDOW_MS };
+    hits.set(req.ip, entry);
+  }
+  entry.count++;
+
+  res.set('X-RateLimit-Limit', String(max));
+  res.set('X-RateLimit-Remaining', String(Math.max(0, max - entry.count)));
+
+  if (entry.count > max) {
+    const retryAfter = Math.ceil((entry.resetAt - now) / 1000);
+    res.set('Retry-After', String(retryAfter));
+    return sendError(res, 429, 'TOO_MANY_REQUESTS', `Too many requests. Please try again in ${retryAfter}s.`);
+  }
+  next();
+}
+
+// Authentication / Authorization (basic version) - used by the admin endpoint
+// 401 = "I don't know who you are" (no key)   -> AuthN
+// 403 = "I know you, but you can't do this"   -> AuthZ
+function requireApiKey(req, res, next) {
+  const expected = process.env.API_KEY || 'decodelabs-secret';
+  const key = req.get('x-api-key');
+  if (!key) {
+    return sendError(res, 401, 'UNAUTHORIZED', 'Missing x-api-key header');
+  }
+  if (key !== expected) {
+    return sendError(res, 403, 'FORBIDDEN', 'Invalid API key - you are not allowed to do this');
+  }
+  next();
+}
+
+// Only accept JSON bodies on POST/PUT/PATCH
+function requireJson(req, res, next) {
+  if (!req.is('application/json')) {
+    return sendError(res, 415, 'UNSUPPORTED_MEDIA_TYPE', 'Content-Type must be application/json');
+  }
+  next();
+}
+
+// Unknown URL -> 404
+function notFound(req, res) {
+  sendError(res, 404, 'NOT_FOUND', `Route ${req.method} ${req.originalUrl} does not exist`);
+}
+
+// Last line of defence: any error ends up here
+function errorHandler(err, req, res, next) {
+  if (err.type === 'entity.parse.failed') {
+    return sendError(res, 400, 'INVALID_JSON', 'Request body is not valid JSON');
+  }
+  if (err.type === 'entity.too.large') {
+    return sendError(res, 413, 'PAYLOAD_TOO_LARGE', 'Request body is too large');
+  }
+  console.error('Unexpected error:', err);
+  // Never leak internal details to the client
+  sendError(res, 500, 'INTERNAL_ERROR', 'Something went wrong on the server');
+}
+
+module.exports = {
+  sendError,
+  asyncHandler,
+  cors,
+  requestLogger,
+  rateLimiter,
+  requireApiKey,
+  requireJson,
+  notFound,
+  errorHandler,
+};

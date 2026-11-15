@@ -1,0 +1,89 @@
+// server.js - the entry point. It wires everything together.
+const express = require('express');
+const path = require('path');
+const db = require('./db');                  // chooses the database (cloud PostgreSQL or local SQLite file)
+const store = require('./store');
+const tasksRouter = require('./routes/tasks');
+const statsRouter = require('./routes/stats');
+const categoriesRouter = require('./routes/categories');
+const adminRouter = require('./routes/admin');
+const { router: logsRouter } = require('./routes/logs');
+const {
+  cors,
+  requestLogger,
+  rateLimiter,
+  asyncHandler,
+  notFound,
+  errorHandler,
+} = require('./middleware');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json({ limit: '10kb' })); // read JSON bodies (max 10 KB)
+app.use(requestLogger);                   // log every request
+app.use('/api', cors);                    // CORS + preflight: lets a page on another address call the API
+
+// The DailyNest page (HTML, CSS, JS) is served from the public folder,
+// so the page and the API share one address: http://localhost:3000
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Health check - also proves the database answers (not rate limited)
+app.get('/api/health', asyncHandler(async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.status(200).json({
+      success: true,
+      data: {
+        status: 'ok',
+        database: 'connected',
+        type: db.isPostgres ? 'postgresql' : 'sqlite',
+        uptimeSeconds: Math.round(process.uptime()),
+      },
+    });
+  } catch (err) {
+    console.error('Health check failed:', err.message);
+    res.status(503).json({
+      success: false,
+      error: { code: 'DATABASE_UNAVAILABLE', message: 'The database is not reachable' },
+    });
+  }
+}));
+
+app.use('/api', rateLimiter);                 // 429 if someone spams the API
+app.use('/api/tasks', tasksRouter);           // GET / POST / PUT / PATCH / DELETE
+app.use('/api/categories', categoriesRouter); // categories + how many tasks each has
+app.use('/api/logs', logsRouter);             // browser pages report their errors here
+app.use('/api/stats', statsRouter);           // progress numbers (calculated by SQL)
+app.use('/api/admin', adminRouter);           // protected by an API key
+
+app.use(notFound);     // unknown URL -> 404
+app.use(errorHandler); // any error -> clean JSON (400 / 413 / 500)
+
+// Only start listening when run directly (so tests can import the app)
+if (require.main === module) {
+  store.init()                                // connect to the database FIRST, then accept visitors
+    .then(() => {
+      const server = app.listen(PORT, () => {
+        console.log(`DailyNest running on http://localhost:${PORT}`);
+        console.log(`Database: ${db.describe()}`);
+      });
+
+      // Ctrl+C: stop taking requests, then close the database cleanly
+      const shutdown = () => {
+        server.close(async () => {
+          await db.close();
+          process.exit(0);
+        });
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+    })
+    .catch((err) => {
+      console.error('Could not start: the database connection failed.');
+      console.error(err.message);
+      process.exit(1);
+    });
+}
+
+module.exports = app;
